@@ -14,6 +14,7 @@ account will relay matching messages in real time.
   * `TELETHON_API_ID`
   * `TELETHON_API_HASH`
 * **Session name (optional)**: set `TELETHON_SESSION` to change the filename used to store the user login session (defaults to `userbot_forwarder`).
+* **Phone number for first-run login**: set `TELETHON_PHONE_NUMBER` so the script can request an authorization code directly from Telegram when no session exists. Once a session is saved you can remove this value.
 * **Bot token**: set `TELEGRAM_BOT_COOKIE` to the token provided by [@BotFather](https://t.me/BotFather). The script will log in as this bot to receive setup commands.
 * **Authorized controllers**: set `TELEGRAM_OWNER_IDS` to a comma-separated list of Telegram user IDs. Only these users can issue commands to the controller bot.
 
@@ -28,8 +29,9 @@ account will relay matching messages in real time.
    TELEGRAM_BOT_COOKIE=123456:ABC-DEF1234   # Bot token from BotFather
    TELEGRAM_OWNER_IDS=111111111,222222222   # Controller Telegram user IDs
    TELETHON_SESSION=userbot_forwarder       # Optional custom session name
+   TELETHON_PHONE_NUMBER=+15551234567       # Phone number for first-run login
    ```
-4. Run the forwarder with `python bot.py` and enter the login code sent to your user account the first time it launches. Subsequent runs reuse the saved session. The script automatically loads variables from the `.env` file using `python-dotenv`.
+4. Run the forwarder with `python bot.py`. On the first launch the script sends a message through the controller bot asking authorized owners to provide the login code with `/code 12345` (and `/password your_password` if two-factor authentication is enabled). Subsequent runs reuse the saved session. The script automatically loads variables from the `.env` file using `python-dotenv`.
 5. Open a private chat with the controller bot using one of the authorized accounts:
    * Send `/listchats` to receive a list of chats and channels the user account can access along with their numeric IDs.
    * Send `/forward` and follow the prompts:
@@ -51,5 +53,6 @@ The chosen rules remain in memory until you stop the process. Restarting the scr
 
 * **`TELETHON_API_ID and TELETHON_API_HASH must be set.`** – make sure both environment variables are exported before running `python bot.py`.
 * **`TELEGRAM_OWNER_IDS must provide at least one user ID when TELEGRAM_BOT_COOKIE is set.`** – bot mode requires a list of authorized controllers.
+* **Login pending** – respond to the controller bot with `/code <digits>` after Telegram delivers the code to your account. If the account has two-factor authentication enabled, follow up with `/password <your_password>`.
 * **Entity resolution failures** – ensure the user account has joined the source and destination chats and that you provide valid numeric IDs when prompted.
 

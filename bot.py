@@ -25,14 +25,16 @@ Environment variables
 * ``TELEGRAM_OWNER_IDS`` – required comma-separated list of Telegram user IDs
   that are allowed to configure forwarding.
 
-Install dependencies with ``pip install telethon`` and run ``python bot.py``.
-The first launch prompts for the login code so the user account can authorize
-the session.
+Install dependencies with ``pip install telethon python-dotenv`` and run
+``python bot.py``. If the user session is not authorized yet, the script will
+send a login prompt to the configured owners via the controller bot so the
+code can be supplied entirely inside Telegram.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 from dataclasses import dataclass
@@ -40,7 +42,13 @@ from typing import Dict, List, Optional, Set
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
-from telethon.errors import RPCError
+from telethon.errors import (
+    PasswordHashInvalidError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    RPCError,
+    SessionPasswordNeededError,
+)
 from telethon.tl import types
 from telethon.utils import get_display_name, get_peer_id
 
@@ -74,6 +82,18 @@ user_client: Optional[TelegramClient] = None
 bot_client: Optional[TelegramClient] = None
 authorized_user_ids: Set[int] = set()
 controller_bot_token: Optional[str] = None
+login_state: Optional["LoginState"] = None
+login_complete_event: Optional[asyncio.Event] = None
+
+
+@dataclass
+class LoginState:
+    """Holds state while the user account authorizes the session."""
+
+    phone_number: str
+    phone_code_hash: str
+    awaiting_code: bool = True
+    awaiting_password: bool = False
 
 
 def parse_owner_ids(raw_value: Optional[str]) -> Set[int]:
@@ -126,7 +146,7 @@ async def start_forward_setup(event: events.NewMessage.Event) -> None:
     state = SetupState(stage="source")
     pending_setups[chat_id] = state
 
-    prompt = await event.respond(
+    await event.respond(
         "Please provide the numeric chat ID of the source channel or group.\n"
         "Send /listchats to view known IDs from the user account or /cancel to abort."
     )
@@ -145,16 +165,16 @@ async def process_setup_response(event: events.NewMessage.Event) -> None:
 
     text = event.raw_text.strip()
     if not text:
-        prompt = await event.respond("Please send a non-empty value or /cancel.")
+        await event.respond("Please send a non-empty value or /cancel.")
         return
 
     if text.lower() == "/cancel":
         pending_setups.pop(chat_id, None)
-        prompt = await event.respond("Forwarding setup cancelled.")
+        await event.respond("Forwarding setup cancelled.")
         return
 
     if text.startswith("/") and text.lower() != "/cancel":
-        prompt = await event.respond(
+        await event.respond(
             "Finish the current setup first or send /cancel to stop configuring."
         )
         return
@@ -163,13 +183,11 @@ async def process_setup_response(event: events.NewMessage.Event) -> None:
         try:
             state.source_id = int(text)
         except ValueError:
-            prompt = await event.respond(
-                "Source IDs must be integers like -1001234567890."
-            )
+            await event.respond("Source IDs must be integers like -1001234567890.")
             return
 
         state.stage = "destination"
-        prompt = await event.respond(
+        await event.respond(
             "Got it! Now send the numeric chat ID for the destination channel or chat."
         )
         return
@@ -178,13 +196,11 @@ async def process_setup_response(event: events.NewMessage.Event) -> None:
         try:
             state.destination_id = int(text)
         except ValueError:
-            prompt = await event.respond(
-                "Destination IDs must be integers like -1001234567890."
-            )
+            await event.respond("Destination IDs must be integers like -1001234567890.")
             return
 
         state.stage = "mode"
-        prompt = await event.respond(
+        await event.respond(
             "Great! Reply with 'all' to forward every message or 'media' to forward "
             "only photos and videos."
         )
@@ -193,9 +209,7 @@ async def process_setup_response(event: events.NewMessage.Event) -> None:
     if state.stage == "mode":
         mode = text.lower()
         if mode not in {"all", "media"}:
-            prompt = await event.respond(
-                "Invalid mode. Please reply with 'all' or 'media'."
-            )
+            await event.respond("Invalid mode. Please reply with 'all' or 'media'.")
             return
 
         await finalize_rule(event, state, mode)
@@ -254,9 +268,7 @@ async def finalize_rule(
     assert user_client is not None  # Guard for type checkers.
 
     if state.source_id is None or state.destination_id is None:
-        prompt = await event.respond(
-            "Setup is incomplete. Please start again with /forward."
-        )
+        await event.respond("Setup is incomplete. Please start again with /forward.")
         return
 
     try:
@@ -264,7 +276,7 @@ async def finalize_rule(
         destination_entity = await user_client.get_entity(state.destination_id)
     except (ValueError, RPCError) as error:  # Entity lookup failed.
         logger.warning("Failed to resolve entity: %s", error)
-        prompt = await event.respond(
+        await event.respond(
             "Unable to resolve one of the chats. Check that you joined both and try again."
         )
         return
@@ -273,9 +285,7 @@ async def finalize_rule(
         destination_peer = await user_client.get_input_entity(destination_entity)
     except (ValueError, RPCError) as error:
         logger.warning("Failed to obtain destination input peer: %s", error)
-        prompt = await event.respond(
-            "Could not prepare the destination for forwarding."
-        )
+        await event.respond("Could not prepare the destination for forwarding.")
         return
 
     source_id = get_peer_id(source_entity)
@@ -295,7 +305,7 @@ async def finalize_rule(
         f"Destination: {rule.destination_label}\n"
         f"Mode: {'all messages' if mode == 'all' else 'photos and videos only'}"
     )
-    prompt = await event.respond(summary)
+    await event.respond(summary)
     logger.info(
         "Created rule source_id=%s destination=%s mode=%s",
         rule.source_id,
@@ -376,6 +386,173 @@ def build_clients() -> None:
     bot_client.add_event_handler(
         process_setup_response, events.NewMessage(incoming=True)
     )
+    bot_client.add_event_handler(
+        handle_login_messages,
+        events.NewMessage(pattern=r"^/(code|password|resendcode)\b", incoming=True),
+    )
+
+
+async def handle_login_messages(event: events.NewMessage.Event) -> None:
+    """Process login commands sent to the controller bot."""
+
+    if not is_authorized_sender(event):
+        return
+
+    assert user_client is not None and bot_client is not None
+
+    if login_state is None:
+        await event.respond("No login is pending. The userbot is already authorized.")
+        return
+
+    command, *rest = event.raw_text.strip().split(maxsplit=1)
+    command = command.lower()
+
+    if command == "/code":
+        if not login_state.awaiting_code:
+            await event.respond(
+                "A login code is not required right now. Send /resendcode if you need a new code."
+            )
+            return
+
+        if not rest:
+            await event.respond("Send /code followed by the digits that Telegram sent you.")
+            return
+
+        code = rest[0].strip()
+        if not code:
+            await event.respond("The code cannot be empty. Please resend with the digits.")
+            return
+
+        try:
+            await user_client.sign_in(
+                phone=login_state.phone_number,
+                code=code,
+                phone_code_hash=login_state.phone_code_hash,
+            )
+        except SessionPasswordNeededError:
+            login_state.awaiting_code = False
+            login_state.awaiting_password = True
+            await event.respond(
+                "This account has a two-step verification password. Reply with /password YOUR_PASSWORD."
+            )
+            return
+        except PhoneCodeInvalidError:
+            await event.respond(
+                "The code was invalid. Double-check and resend, or use /resendcode for a new one."
+            )
+            return
+        except PhoneCodeExpiredError:
+            await event.respond("That code expired. Use /resendcode to request a new one.")
+            return
+        except RPCError as error:
+            logger.warning("Failed to sign in with provided code: %s", error)
+            await event.respond(
+                "Login failed due to an unexpected error. Try /resendcode for a new code."
+            )
+            return
+
+        await finalize_login(event)
+        return
+
+    if command == "/password":
+        if not login_state.awaiting_password:
+            await event.respond(
+                "A password is not required right now. Provide a login code with /code."
+            )
+            return
+
+        if not rest:
+            await event.respond("Send /password followed by your two-step verification password.")
+            return
+
+        password = rest[0]
+        try:
+            await user_client.sign_in(password=password)
+        except PasswordHashInvalidError:
+            await event.respond("Incorrect password. Please try again.")
+            return
+        except RPCError as error:
+            logger.warning("Password sign-in failed: %s", error)
+            await event.respond("Unable to complete login. Please try again.")
+            return
+
+        await finalize_login(event)
+        return
+
+    if command == "/resendcode":
+        try:
+            code = await user_client.send_code_request(login_state.phone_number)
+        except RPCError as error:
+            logger.warning("Failed to resend login code: %s", error)
+            await event.respond("Unable to resend the code right now. Try again later.")
+            return
+
+        login_state.phone_code_hash = code.phone_code_hash
+        login_state.awaiting_code = True
+        login_state.awaiting_password = False
+        await event.respond("A new login code was sent. Use /code to submit it here.")
+        return
+
+
+async def finalize_login(event: events.NewMessage.Event) -> None:
+    """Complete the login flow after a code or password succeeds."""
+
+    assert login_complete_event is not None and bot_client is not None
+
+    global login_state
+
+    login_state = None
+    await event.respond("Login successful! The userbot is now authorized.")
+    login_complete_event.set()
+
+    sender_id = event.sender_id
+    for user_id in sorted(authorized_user_ids):
+        if user_id == sender_id:
+            continue
+        try:
+            await bot_client.send_message(
+                user_id, "Login complete. The userbot is now connected."
+            )
+        except RPCError as error:
+            logger.warning("Failed to broadcast login success to %s: %s", user_id, error)
+
+
+async def ensure_user_authorized() -> None:
+    """Make sure the user client is ready, requesting codes via Telegram when needed."""
+
+    assert user_client is not None and bot_client is not None and login_complete_event is not None
+
+    await user_client.connect()
+
+    if await user_client.is_user_authorized():
+        await user_client.start()
+        login_complete_event.set()
+        return
+
+    phone_number = os.getenv("TELETHON_PHONE_NUMBER")
+    if not phone_number:
+        raise RuntimeError(
+            "Set TELETHON_PHONE_NUMBER to allow Telegram-based login when no session exists."
+        )
+
+    code = await user_client.send_code_request(phone_number)
+
+    global login_state
+    login_state = LoginState(phone_number=phone_number, phone_code_hash=code.phone_code_hash)
+    login_complete_event.clear()
+
+    message = (
+        "Userbot authorization required. Telegram sent a login code to the configured "
+        "account. Reply here with /code <digits>."
+    )
+    for user_id in sorted(authorized_user_ids):
+        try:
+            await bot_client.send_message(user_id, message)
+        except RPCError as error:
+            logger.warning("Failed to deliver login prompt to owner %s: %s", user_id, error)
+
+    await login_complete_event.wait()
+    await user_client.start()
 
 
 async def async_main() -> None:
@@ -385,6 +562,7 @@ async def async_main() -> None:
     global bot_client
     global authorized_user_ids
     global controller_bot_token
+    global login_complete_event
 
     logging.basicConfig(
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -405,17 +583,20 @@ async def async_main() -> None:
         user_client is not None and bot_client is not None and controller_bot_token
     )
 
-    async with user_client, bot_client:
-        await user_client.start()
+    authorized_user_ids = configured_owner_ids
+    login_complete_event = asyncio.Event()
 
-        await bot_client.start(bot_token=controller_bot_token)
+    await bot_client.start(bot_token=controller_bot_token)
+    bot_task = asyncio.create_task(bot_client.run_until_disconnected())
+    user_task: Optional[asyncio.Task[None]] = None
+
+    try:
+        await ensure_user_authorized()
 
         me = await user_client.get_me()
         bot_info = await bot_client.get_me()
         if me is None or bot_info is None:
             raise RuntimeError("Failed to determine account identities.")
-
-        authorized_user_ids = configured_owner_ids
 
         logger.info(
             "Userbot logged in as %s; bot controller is @%s",
@@ -433,10 +614,18 @@ async def async_main() -> None:
             except RPCError as error:
                 logger.warning("Failed to notify owner %s: %s", user_id, error)
 
-        await asyncio.gather(
-            user_client.run_until_disconnected(),
-            bot_client.run_until_disconnected(),
-        )
+        user_task = asyncio.create_task(user_client.run_until_disconnected())
+        await asyncio.gather(bot_task, user_task)
+    finally:
+        bot_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await bot_task
+        if user_task is not None:
+            user_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await user_task
+        await user_client.disconnect()
+        await bot_client.disconnect()
 
 
 def main() -> None:
