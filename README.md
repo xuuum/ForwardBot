@@ -22,7 +22,7 @@ account will relay matching messages in real time.
 
 1. Join both the source and destination chats with the user account that will run the forwarder.
 2. Create a Telegram bot and copy its token.
-3. Create a `.env` file in the project directory with the required environment variables:
+3. In the `.env` file in the project directory:
    ```env
    TELETHON_API_ID=123456
    TELETHON_API_HASH=your_api_hash
