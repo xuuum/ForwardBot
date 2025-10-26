@@ -513,8 +513,10 @@ async def finalize_login(event: events.NewMessage.Event) -> None:
             await bot_client.send_message(
                 user_id, "Login complete. The userbot is now connected."
             )
-        except RPCError as error:
-            logger.warning("Failed to broadcast login success to %s: %s", user_id, error)
+        except (RPCError, ValueError) as error:
+            logger.warning(
+                "Failed to broadcast login success to %s: %s", user_id, error
+            )
 
 
 async def ensure_user_authorized() -> None:
@@ -548,8 +550,10 @@ async def ensure_user_authorized() -> None:
     for user_id in sorted(authorized_user_ids):
         try:
             await bot_client.send_message(user_id, message)
-        except RPCError as error:
-            logger.warning("Failed to deliver login prompt to owner %s: %s", user_id, error)
+        except (RPCError, ValueError) as error:
+            logger.warning(
+                "Failed to deliver login prompt to owner %s: %s", user_id, error
+            )
 
     await login_complete_event.wait()
     await user_client.start()
