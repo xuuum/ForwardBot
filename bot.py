@@ -38,6 +38,7 @@ import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
 
+from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import RPCError
 from telethon.tl import types
@@ -334,6 +335,8 @@ def build_clients() -> None:
     global user_client
     global bot_client
     global controller_bot_token
+
+    load_dotenv()
 
     api_id_text = os.getenv("TELETHON_API_ID")
     api_hash = os.getenv("TELETHON_API_HASH")
