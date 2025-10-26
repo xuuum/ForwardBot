@@ -1,36 +1,3 @@
-"""Telegram forwarder built with Telethon.
-
-The script signs in as a full Telegram user account so it can read from source
-channels and forward to destinations that ordinary bots cannot access. A
-separate Bot API controller receives commands from trusted owners and updates
-forwarding rules without requiring console interaction.
-
-Workflow:
-1. Start the script and complete the first-run login for the user session.
-2. Chat with the controller bot from an authorized account.
-3. Use ``/listchats`` to discover chat IDs available to the user.
-4. Use ``/forward`` to provide the source ID, destination ID, and forwarding
-   mode (``all`` or ``media``).
-
-Rules are stored in memory until the process stops.
-
-Environment variables
----------------------
-* ``TELETHON_API_ID`` – required, obtained from https://my.telegram.org.
-* ``TELETHON_API_HASH`` – required, obtained alongside the API ID.
-* ``TELETHON_SESSION`` – optional session file name (defaults to
-  ``userbot_forwarder``).
-* ``TELEGRAM_BOT_COOKIE`` – required Bot API token for the controller bot
-  (format ``123456:ABC-DEF``).
-* ``TELEGRAM_OWNER_IDS`` – required comma-separated list of Telegram user IDs
-  that are allowed to configure forwarding.
-
-Install dependencies with ``pip install telethon python-dotenv`` and run
-``python bot.py``. If the user session is not authorized yet, the script will
-send a login prompt to the configured owners via the controller bot so the
-code can be supplied entirely inside Telegram.
-"""
-
 from __future__ import annotations
 
 import asyncio
